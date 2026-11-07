@@ -19,11 +19,10 @@ jobs:
 
       - name: Unpack source
         run: |
-          set -e
+          set -euo pipefail
           rm -rf "$SRC_DIR"
           mkdir -p "$SRC_DIR"
           tar -xzf source.tar.gz -C "$SRC_DIR"
-          echo "top-level of $SRC_DIR:"
           ls -la "$SRC_DIR" | head -30
           test -f "$SRC_DIR/gradlew" || { echo "FATAL: gradlew missing"; exit 1; }
           test -f "$SRC_DIR/keystore/workspace.jks" || { echo "FATAL: keystore missing"; exit 1; }
@@ -35,80 +34,79 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # 不用 android-actions/setup-android@v3 —— 它在 runner 上调用
-      # cmdline-tools/16.0/bin/sdkmanager 会 exit 1，把整个 job 带崩。
-      # ubuntu-latest 自带 Android SDK，这里只做探测 + 按需补装。
-      - name: Configure Android SDK
+      - name: Locate Android SDK
         run: |
-          set -e
+          set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          if [ ! -d "$SDK" ]; then
-            echo "FATAL: Android SDK not found"; exit 1
-          fi
+          test -d "$SDK" || { echo "FATAL: SDK dir missing"; exit 1; }
           echo "SDK=$SDK"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK"     >> "$GITHUB_ENV"
-
           SDKM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)
-          if [ -z "$SDKM" ]; then
-            SDKM=$(command -v sdkmanager || true)
-          fi
-          echo "SDKMANAGER=$SDKM"
-          test -n "$SDKM" || { echo "FATAL: sdkmanager not found"; exit 1; }
+          [ -n "${SDKM:-}" ] || SDKM=$(command -v sdkmanager || true)
+          test -n "${SDKM:-}" || { echo "FATAL: sdkmanager not found"; exit 1; }
           echo "SDKMANAGER=$SDKM" >> "$GITHUB_ENV"
+          echo "--- platforms before ---";   ls "$SDK/platforms"   2>/dev/null || true
+          echo "--- build-tools before ---"; ls "$SDK/build-tools" 2>/dev/null || true
 
-          echo "--- installed platforms (before) ---"
-          ls "$SDK/platforms"   2>/dev/null || true
-          echo "--- installed build-tools (before) ---"
-          ls "$SDK/build-tools" 2>/dev/null || true
-
-      - name: Install platform + build-tools
+      - name: Accept licenses
         run: |
-          set -o pipefail
-          # licenses 没人喂输入会失败，用 yes 管道，失败也不终止
           yes | "$SDKMANAGER" --licenses > /tmp/lic.log 2>&1 || true
           tail -3 /tmp/lic.log || true
 
-          # 优先 36；失败再退 35。每个包单独装，避免一个失败拖垮整批。
-          for pkg in "platforms;android-36" "build-tools;36.0.0"; do
-            echo "==> installing $pkg"
-            if ! "$SDKMANAGER" "$pkg" > /tmp/inst.log 2>&1; then
-              echo "    WARN: $pkg failed, see log"; tail -20 /tmp/inst.log
+      - name: Install platform + build-tools
+        run: |
+          set -uo pipefail
+          echo "--- repo platforms 3x ---"
+          "$SDKMANAGER" --list 2>/dev/null | grep -E "platforms;android-3[5-9]" | sort -u | head -20 || true
+          echo "--- repo build-tools 3x ---"
+          "$SDKMANAGER" --list 2>/dev/null | grep -E "build-tools;3[5-9]" | sort -u | head -20 || true
+
+          ok=0
+          for pkg in "platforms;android-37" "platforms;android-36.1" "platforms;android-36"; do
+            ver="${pkg#platforms;}"
+            echo "==> $pkg"
+            "$SDKMANAGER" "$pkg" > /tmp/ip.log 2>&1 || { echo "    sdkmanager rc!=0"; tail -15 /tmp/ip.log; }
+            if [ -d "$ANDROID_SDK_ROOT/platforms/$ver" ]; then
+              echo "    PRESENT platforms/$ver"
+              ok=1
+              [ "$ver" != "android-37" ] && echo "PLATFORM_INSTALLED=$ver" >> "$GITHUB_ENV"
+              break
             fi
           done
+          [ $ok -eq 1 ] || { echo "FATAL: no usable platform installed"; exit 1; }
 
-          if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-36" ]; then
-            echo "==> android-36 missing, falling back to android-35"
-            "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" > /tmp/inst2.log 2>&1 \
-              || { echo "FATAL: cannot install any platform"; tail -30 /tmp/inst2.log; exit 1; }
-            echo "FALLBACK_SDK=35" >> "$GITHUB_ENV"
-          fi
+          for bt in "build-tools;37.0.0" "build-tools;36.1.0" "build-tools;36.0.0"; do
+            echo "==> $bt"
+            if "$SDKMANAGER" "$bt" > /tmp/ib.log 2>&1; then echo "    OK $bt"; break; fi
+            echo "    failed"; tail -8 /tmp/ib.log
+          done
 
-          echo "--- platforms (after) ---"
-          ls "$ANDROID_SDK_ROOT/platforms"
-          echo "--- build-tools (after) ---"
-          ls "$ANDROID_SDK_ROOT/build-tools"
+          echo "--- platforms after ---";   ls "$ANDROID_SDK_ROOT/platforms"
+          echo "--- build-tools after ---"; ls "$ANDROID_SDK_ROOT/build-tools"
 
       - name: Verify keystore
         working-directory: src
         run: |
-          set -e
+          set -euo pipefail
           ls -lh keystore/workspace.jks
           keytool -list -keystore keystore/workspace.jks -storepass agentnb666 | head -5
 
       - name: Tune gradle for CI
         working-directory: src
         run: |
-          set -e
+          set -euo pipefail
           sed -i 's|^org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx6144m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8|' gradle.properties
           sed -i 's|^org.gradle.parallel=.*|org.gradle.parallel=true|' gradle.properties
           sed -i 's|^org.gradle.workers.max=.*|org.gradle.workers.max=4|' gradle.properties
-          grep -q '^org.gradle.parallel='   gradle.properties || echo 'org.gradle.parallel=true'   >> gradle.properties
-          grep -q '^org.gradle.workers.max=' gradle.properties || echo 'org.gradle.workers.max=4' >> gradle.properties
+          grep -q '^org.gradle.parallel='   gradle.properties || echo 'org.gradle.parallel=true'     >> gradle.properties
+          grep -q '^org.gradle.workers.max=' gradle.properties || echo 'org.gradle.workers.max=4'    >> gradle.properties
           echo "--- gradle.properties ---"
           cat gradle.properties
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
           cat local.properties
+          echo "--- compileSdk/targetSdk in build.gradle.kts ---"
+          grep -n 'compileSdk = \|targetSdk = ' app/build.gradle.kts
 
       - name: Grant exec on gradlew
         working-directory: src
@@ -122,6 +120,7 @@ jobs:
           SIGNING_KEY_ALIAS: workspacenb666
           SIGNING_KEY_PASSWORD: agentnb666
         run: |
+          set -o pipefail
           ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/gradle.log
 
       - name: Collect build log tail
@@ -139,7 +138,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: workspace-apk
-          path: src/app/build/outputs/apk/release/*.apk
+          path: |
+            src/app/build/outputs/apk/release/*.apk
+            src/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 7
 
