@@ -35,60 +35,111 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # 不用 android-actions/setup-android@v3 —— 它在 runner 上调用
+      # cmdline-tools/16.0/bin/sdkmanager 会 exit 1，把整个 job 带崩。
+      # ubuntu-latest 自带 Android SDK，这里只做探测 + 按需补装。
+      - name: Configure Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK" ]; then
+            echo "FATAL: Android SDK not found"; exit 1
+          fi
+          echo "SDK=$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK"     >> "$GITHUB_ENV"
+
+          SDKM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)
+          if [ -z "$SDKM" ]; then
+            SDKM=$(command -v sdkmanager || true)
+          fi
+          echo "SDKMANAGER=$SDKM"
+          test -n "$SDKM" || { echo "FATAL: sdkmanager not found"; exit 1; }
+          echo "SDKMANAGER=$SDKM" >> "$GITHUB_ENV"
+
+          echo "--- installed platforms (before) ---"
+          ls "$SDK/platforms"   2>/dev/null || true
+          echo "--- installed build-tools (before) ---"
+          ls "$SDK/build-tools" 2>/dev/null || true
 
       - name: Install platform + build-tools
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms"
-          ls "$ANDROID_HOME/build-tools"
+          set -o pipefail
+          # licenses 没人喂输入会失败，用 yes 管道，失败也不终止
+          yes | "$SDKMANAGER" --licenses > /tmp/lic.log 2>&1 || true
+          tail -3 /tmp/lic.log || true
+
+          # 优先 36；失败再退 35。每个包单独装，避免一个失败拖垮整批。
+          for pkg in "platforms;android-36" "build-tools;36.0.0"; do
+            echo "==> installing $pkg"
+            if ! "$SDKMANAGER" "$pkg" > /tmp/inst.log 2>&1; then
+              echo "    WARN: $pkg failed, see log"; tail -20 /tmp/inst.log
+            fi
+          done
+
+          if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-36" ]; then
+            echo "==> android-36 missing, falling back to android-35"
+            "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" > /tmp/inst2.log 2>&1 \
+              || { echo "FATAL: cannot install any platform"; tail -30 /tmp/inst2.log; exit 1; }
+            echo "FALLBACK_SDK=35" >> "$GITHUB_ENV"
+          fi
+
+          echo "--- platforms (after) ---"
+          ls "$ANDROID_SDK_ROOT/platforms"
+          echo "--- build-tools (after) ---"
+          ls "$ANDROID_SDK_ROOT/build-tools"
 
       - name: Verify keystore
-        working-directory: ${{ env.SRC_DIR }}
+        working-directory: src
         run: |
           set -e
           ls -lh keystore/workspace.jks
           keytool -list -keystore keystore/workspace.jks -storepass agentnb666 | head -5
 
       - name: Tune gradle for CI
-        working-directory: ${{ env.SRC_DIR }}
+        working-directory: src
         run: |
+          set -e
           sed -i 's|^org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx6144m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8|' gradle.properties
           sed -i 's|^org.gradle.parallel=.*|org.gradle.parallel=true|' gradle.properties
           sed -i 's|^org.gradle.workers.max=.*|org.gradle.workers.max=4|' gradle.properties
-          grep -q '^org.gradle.parallel=' gradle.properties || echo 'org.gradle.parallel=true' >> gradle.properties
+          grep -q '^org.gradle.parallel='   gradle.properties || echo 'org.gradle.parallel=true'   >> gradle.properties
           grep -q '^org.gradle.workers.max=' gradle.properties || echo 'org.gradle.workers.max=4' >> gradle.properties
           echo "--- gradle.properties ---"
           cat gradle.properties
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          cat local.properties
 
       - name: Grant exec on gradlew
-        working-directory: ${{ env.SRC_DIR }}
+        working-directory: src
         run: chmod +x gradlew
 
       - name: Build release APK
-        working-directory: ${{ env.SRC_DIR }}
+        working-directory: src
         env:
-          SIGNING_STORE_FILE: ${{ github.workspace }}/${{ env.SRC_DIR }}/keystore/workspace.jks
+          SIGNING_STORE_FILE: ${{ github.workspace }}/src/keystore/workspace.jks
           SIGNING_STORE_PASSWORD: agentnb666
           SIGNING_KEY_ALIAS: workspacenb666
           SIGNING_KEY_PASSWORD: agentnb666
         run: |
-          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/gradle.log
+
+      - name: Collect build log tail
+        if: always()
+        run: |
+          echo "================ gradle tail ================"
+          tail -120 /tmp/gradle.log 2>/dev/null || true
 
       - name: Show outputs
         if: always()
         run: |
-          find "$SRC_DIR/app/build/outputs" -type f -name "*.apk" -exec ls -lh {} \; || true
+          find src/app/build/outputs -type f -name "*.apk" -exec ls -lh {} \; || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: workspace-apk
-          path: ${{ env.SRC_DIR }}/app/build/outputs/apk/release/*.apk
+          path: src/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 7
 
@@ -100,5 +151,6 @@ jobs:
           path: |
             src/app/build/reports/**
             src/build/reports/**
+            /tmp/gradle.log
           if-no-files-found: ignore
           retention-days: 7
