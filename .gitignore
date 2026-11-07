@@ -1,0 +1,3 @@
+# 仓库根只存打包产物与 workflow，源码在 source.tar.gz 内
+# 忽略 CI 展开出来的源码目录，避免二次提交
+/src/
