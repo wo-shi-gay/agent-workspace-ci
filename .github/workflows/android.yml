@@ -12,6 +12,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -38,65 +40,33 @@ jobs:
         run: |
           set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          test -d "$SDK" || { echo "FATAL: SDK dir missing"; exit 1; }
-          echo "SDK=$SDK"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK"     >> "$GITHUB_ENV"
-          SDKM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)
-          [ -n "${SDKM:-}" ] || SDKM=$(command -v sdkmanager || true)
-          test -n "${SDKM:-}" || { echo "FATAL: sdkmanager not found"; exit 1; }
-          echo "SDKMANAGER=$SDKM" >> "$GITHUB_ENV"
-          echo "--- platforms before ---";   ls "$SDK/platforms"   2>/dev/null || true
-          echo "--- build-tools before ---"; ls "$SDK/build-tools" 2>/dev/null || true
+          echo "SDK found at $SDK"
+          ls "$SDK" || true
 
       - name: Accept licenses
         run: |
-          yes | "$SDKMANAGER" --licenses > /tmp/lic.log 2>&1 || true
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /tmp/lic.log 2>&1 || true
           tail -3 /tmp/lic.log || true
 
       - name: Install platform + build-tools
         run: |
-          set -uo pipefail
-          echo "--- repo platforms 3x ---"
-          "$SDKMANAGER" --list 2>/dev/null | grep -E "platforms;android-3[5-9]" | sort -u | head -20 || true
-          echo "--- repo build-tools 3x ---"
-          "$SDKMANAGER" --list 2>/dev/null | grep -E "build-tools;3[5-9]" | sort -u | head -20 || true
-
-          ok=0
-          for pkg in "platforms;android-37" "platforms;android-36.1" "platforms;android-36"; do
-            ver="${pkg#platforms;}"
-            echo "==> $pkg"
-            "$SDKMANAGER" "$pkg" > /tmp/ip.log 2>&1 || { echo "    sdkmanager rc!=0"; tail -15 /tmp/ip.log; }
-            if [ -d "$ANDROID_SDK_ROOT/platforms/$ver" ]; then
-              echo "    PRESENT platforms/$ver"
-              ok=1
-              [ "$ver" != "android-37" ] && echo "PLATFORM_INSTALLED=$ver" >> "$GITHUB_ENV"
-              break
-            fi
-          done
-          [ $ok -eq 1 ] || { echo "FATAL: no usable platform installed"; exit 1; }
-
-          for bt in "build-tools;37.0.0" "build-tools;36.1.0" "build-tools;36.0.0"; do
-            echo "==> $bt"
-            if "$SDKMANAGER" "$bt" > /tmp/ib.log 2>&1; then echo "    OK $bt"; break; fi
-            echo "    failed"; tail -8 /tmp/ib.log
-          done
-
-          echo "--- platforms after ---";   ls "$ANDROID_SDK_ROOT/platforms"
-          echo "--- build-tools after ---"; ls "$ANDROID_SDK_ROOT/build-tools"
+          set -euo pipefail
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" > /tmp/sdk.log 2>&1 || true
+          tail -5 /tmp/sdk.log || true
+          echo "--- platforms after ---"; ls "$ANDROID_SDK_ROOT/platforms" || true
 
       - name: Verify keystore
-        working-directory: src
         run: |
           set -euo pipefail
-          ls -lh keystore/workspace.jks
-          keytool -list -keystore keystore/workspace.jks -storepass agentnb666 | head -5
+          ls -lh src/keystore/workspace.jks
 
       - name: Tune gradle for CI
         working-directory: src
         run: |
           set -euo pipefail
-          sed -i 's|^org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx6144m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8|' gradle.properties
+          sed -i 's|^org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8|' gradle.properties
           sed -i 's|^org.gradle.parallel=.*|org.gradle.parallel=true|' gradle.properties
           sed -i 's|^org.gradle.workers.max=.*|org.gradle.workers.max=4|' gradle.properties
           grep -q '^org.gradle.parallel='   gradle.properties || echo 'org.gradle.parallel=true'     >> gradle.properties
@@ -112,7 +82,7 @@ jobs:
         working-directory: src
         run: chmod +x gradlew
 
-      - name: Build release APK
+      - name: Build release APK (R8 disabled)
         working-directory: src
         env:
           SIGNING_STORE_FILE: ${{ github.workspace }}/src/keystore/workspace.jks
@@ -143,6 +113,30 @@ jobs:
             src/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish Release (fast download via github.com)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APK=$(find src/app/build/outputs/apk -type f -name "*.apk" | head -1)
+          echo "APK=$APK"
+          test -n "$APK"
+          VER=$(grep -m1 'APP_VERSION_NAME' src/app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
+          echo "VER=$VER"
+          TAG="v$VER"
+          OUT="AgentPad-$VER.apk"
+          cp "$APK" "$OUT"
+          ls -lh "$OUT"
+          gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$TAG" "$OUT" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "AgentPad $VER" \
+            --notes "自动云端构建 · commit $GITHUB_SHA · R8 关闭" || \
+          gh release upload "$TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "RELEASE_URL=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$OUT" >> "$GITHUB_ENV"
+          echo "published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
 
       - name: Upload build reports on failure
         if: failure()
